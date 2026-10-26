@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: three-tier-app
-        image: sarthakiparad2230/three-tier-app:v1
+        image: yashdolare2230/three-tier-app:v1 
         ports:
         - containerPort: 3000
         envFrom:
