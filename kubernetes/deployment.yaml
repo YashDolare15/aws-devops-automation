@@ -7,7 +7,7 @@ metadata:
 spec:
   replicas: 3
   selector:
-    matchLabels: 
+    matchLabels:
       app: three-tier-app
   template:
     metadata:
@@ -16,26 +16,12 @@ spec:
     spec:
       containers:
       - name: three-tier-app
-        image: three-tier-app:v1
-        ports:
-        - containerPort: 3000apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: three-tier-app-deployment
-  labels:
-    app: three-tier-app
-spec:
-  replicas: 3
-  selector:
-    matchLabels: 
-      app: three-tier-app
-  template:
-    metadata:
-      labels:
-        app: three-tier-app
-    spec:
-      containers:
-      - name: three-tier-app
-        image: three-tier-app:v1
+        image: sarthakiparad2230/three-tier-app:v1
         ports:
         - containerPort: 3000
+        envFrom:
+          - secretRef:
+            name: three-tier-app-db-secrets
+        env:
+          - name: PORT
+            value: "3000"
