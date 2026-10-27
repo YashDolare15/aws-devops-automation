@@ -1,0 +1,294 @@
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    environment {
+        GIT_REPO = 'https://github.com/YashDolare15/aws-devops-automation.git'
+        GIT_BRANCH = 'main'
+
+        DOCKERHUB_REPO = 'yashdolare2230/three-tier-app'
+
+        AWS_REGION = 'us-east-1'
+        EKS_CLUSTER = 'AWSCluster'
+        K8S_DEPLOYMENT = 'three-tier-app-deployment'
+        K8S_CONTAINER = 'three-tier-app'
+        K8S_SERVICE = 'three-tier-app-service'
+
+        DOCKERHUB_CREDENTIALS = 'dockerhub-credentials'
+        RDS_HOST_CREDENTIAL = 'rds-db-host'
+        RDS_NAME_CREDENTIAL = 'rds-db-name'
+        RDS_CREDENTIALS = 'rds-mysql-credentials'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                deleteDir()
+
+                git branch: "${GIT_BRANCH}",
+                    url: "${GIT_REPO}"
+
+                sh '''
+                    set -eu
+
+                    echo "Checking application files..."
+
+                    test -f package.json
+                    test -f server.js
+                    test -f db.js
+                    test -f dockerfile
+                    test -f kubernetes/deployment.yaml
+                    test -f kubernetes/service.yaml
+
+                    echo "All required files are present."
+
+                    echo "Checking for tracked .env files..."
+                    if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+                        echo "WARNING: .env is tracked in Git."
+                        echo "Remove it from Git and rotate any exposed credentials."
+                    fi
+                '''
+            }
+        }
+
+        stage('Validate Application') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Checking Node.js application configuration..."
+                    node --version
+                    npm --version
+
+                    node -e "
+                      const p = require('./package.json');
+                      if (!p.scripts || !p.scripts.start) {
+                        console.error('Missing npm start script');
+                        process.exit(1);
+                      }
+                      console.log('Start script:', p.scripts.start);
+                    "
+
+                    echo "Application validation successful."
+                '''
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    env.IMAGE_TAG = "${BUILD_NUMBER}"
+                    env.IMAGE = "${DOCKERHUB_REPO}:${BUILD_NUMBER}"
+                }
+
+                sh '''
+                    set -eu
+
+                    docker build \
+                        -f dockerfile \
+                        -t "$IMAGE" .
+
+                    docker image inspect "$IMAGE" >/dev/null
+
+                    echo "Docker image built: $IMAGE"
+                '''
+            }
+        }
+
+        stage('Test Docker Image') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Checking the built image..."
+                    docker run --rm "$IMAGE" node --version
+
+                    if node -e "
+                      const p = require('./package.json');
+                      process.exit(p.scripts && p.scripts.test ? 0 : 1);
+                    "; then
+                        echo "Running application tests..."
+                        docker run --rm "$IMAGE" npm test
+                    else
+                        echo "No test script configured; skipping npm test."
+                    fi
+
+                    echo "Image checks completed."
+                '''
+            }
+        }
+
+        stage('Push Image to Docker Hub') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: "${DOCKERHUB_CREDENTIALS}",
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+
+                        echo "$DOCKER_PASSWORD" |
+                            docker login \
+                                --username "$DOCKER_USER" \
+                                --password-stdin
+
+                        docker push "$IMAGE"
+
+                        docker logout
+                    '''
+                }
+            }
+        }
+
+        stage('Connect to EKS') {
+            steps {
+                sh '''
+                    set -eu
+
+                    aws --version
+                    kubectl version --client
+
+                    aws eks update-kubeconfig \
+                        --region "$AWS_REGION" \
+                        --name "$EKS_CLUSTER"
+
+                    echo "Checking Kubernetes cluster access..."
+                    kubectl get nodes
+                '''
+            }
+        }
+
+        stage('Configure RDS Secret') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: "${RDS_HOST_CREDENTIAL}",
+                        variable: 'DB_HOST'
+                    ),
+                    string(
+                        credentialsId: "${RDS_NAME_CREDENTIAL}",
+                        variable: 'DB_NAME'
+                    ),
+                    usernamePassword(
+                        credentialsId: "${RDS_CREDENTIALS}",
+                        usernameVariable: 'DB_USER',
+                        passwordVariable: 'DB_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        set +x
+                        set -eu
+
+                        test -n "$DB_HOST"
+                        test -n "$DB_NAME"
+                        test -n "$DB_USER"
+                        test -n "$DB_PASSWORD"
+
+                        kubectl create secret generic rds-credentials \
+                            --from-literal=DB_HOST="$DB_HOST" \
+                            --from-literal=DB_NAME="$DB_NAME" \
+                            --from-literal=DB_USER="$DB_USER" \
+                            --from-literal=DB_PASSWORD="$DB_PASSWORD" \
+                            --dry-run=client -o yaml |
+                            kubectl apply -f -
+
+                        echo "RDS Kubernetes Secret configured."
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Applying Kubernetes manifests..."
+                    kubectl apply -f kubernetes/deployment.yaml
+                    kubectl apply -f kubernetes/service.yaml
+
+                    echo "Updating application image..."
+                    kubectl set image \
+                        deployment/"$K8S_DEPLOYMENT" \
+                        "$K8S_CONTAINER"="$IMAGE"
+
+                    echo "Waiting for rollout..."
+                    if ! kubectl rollout status \
+                        deployment/"$K8S_DEPLOYMENT" \
+                        --timeout=300s; then
+
+                        echo "Deployment failed. Checking rollout history..."
+                        kubectl rollout history \
+                            deployment/"$K8S_DEPLOYMENT" || true
+
+                        echo "Attempting rollback..."
+                        kubectl rollout undo \
+                            deployment/"$K8S_DEPLOYMENT" || true
+
+                        exit 1
+                    fi
+
+                    echo "Kubernetes deployment completed."
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Deployment status:"
+                    kubectl get deployment "$K8S_DEPLOYMENT"
+
+                    echo "Pods:"
+                    kubectl get pods -o wide
+
+                    echo "Service:"
+                    kubectl get service "$K8S_SERVICE"
+
+                    READY=$(kubectl get deployment "$K8S_DEPLOYMENT" \
+                        -o jsonpath='{.status.readyReplicas}')
+
+                    DESIRED=$(kubectl get deployment "$K8S_DEPLOYMENT" \
+                        -o jsonpath='{.spec.replicas}')
+
+                    echo "Ready replicas: ${READY:-0}/${DESIRED:-0}"
+
+                    if [ "${READY:-0}" != "${DESIRED:-0}" ] ||
+                       [ "${DESIRED:-0}" = "0" ]; then
+                        echo "Not all replicas are ready."
+                        exit 1
+                    fi
+
+                    echo "Deployment verification successful."
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'CI/CD pipeline completed successfully!'
+            echo 'The application image has been pushed and deployed to EKS.'
+        }
+
+        failure {
+            echo 'Pipeline failed. Check Console Output for the first failing stage.'
+        }
+
+        always {
+            echo 'Pipeline execution finished.'
+        }
+    }
+}
